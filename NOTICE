@@ -1,0 +1,13 @@
+Maibot_Emoji_Select_With_Text
+Attribution and modification notice
+
+This project contains a modified version of Emoji Text Selector,
+originally developed by hsd221:
+https://github.com/hsd221/maibot-plugin-emoji-text-selection
+
+The upstream project credits CharTyr/MaiBot-Better-Expression as a
+design reference for its semantic embedding cache and retrieval mechanism:
+https://github.com/CharTyr/MaiBot-Better-Expression
+
+This independent version was modified by TogawaSakiko-desuwa in July 2026.
+It is distributed under GPL-3.0-or-later. See LICENSE.

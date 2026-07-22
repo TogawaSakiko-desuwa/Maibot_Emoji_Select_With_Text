@@ -1,0 +1,4 @@
+config_back/
+.venv/
+__pycache__/
+.cache/

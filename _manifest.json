@@ -1,0 +1,31 @@
+{
+  "manifest_version": 2,
+  "version": "1.0.0",
+  "name": "Maibot_Emoji_Select_With_Text",
+  "description": "表情包选择工具，支持 embedding 语义向量匹配和文本 LLM 选择",
+  "author": {
+    "name": "TogawaSakiko-desuwa",
+    "url": "https://github.com/TogawaSakiko-desuwa/Maibot_Emoji_Select_With_Text"
+  },
+  "license": "GPL-3.0-or-later",
+  "urls": {
+    "repository": "https://github.com/TogawaSakiko-desuwa/Maibot_Emoji_Select_With_Text",
+    "homepage": "https://github.com/TogawaSakiko-desuwa/Maibot_Emoji_Select_With_Text",
+    "documentation": "https://github.com/TogawaSakiko-desuwa/Maibot_Emoji_Select_With_Text#readme"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.9.9"
+  },
+  "sdk": {
+    "min_version": "2.7.1",
+    "max_version": "2.7.1"
+  },
+  "dependencies": [],
+  "capabilities": ["send.emoji", "emoji.get_all", "llm.embed", "llm.generate", "message.get_recent"],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": ["zh-CN"]
+  },
+  "id": "togawasakiko-desuwa.emoji-select-with-text"
+}

@@ -1,0 +1,17 @@
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[general]
+filter_send_emoji = true
+
+[selector]
+max_emotion_tags = 0
+llm_model = "utils"
+context_message_limit = 30
+
+[semantic]
+enabled = false
+refresh_interval_seconds = 300
+similarity_threshold = 0.3
+embed_batch_size = 64
