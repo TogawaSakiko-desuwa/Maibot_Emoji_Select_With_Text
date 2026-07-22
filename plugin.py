@@ -19,7 +19,7 @@ import numpy as np
 from maibot_sdk import HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
-from . import config_models, emoji_cache, prompting
+from . import config_models, emoji_cache, prompting, selection
 
 logger = logging.getLogger("Maibot_Emoji_Select_With_Text")
 # ─── 插件主类 ───────────────────────────────────────────────────
@@ -334,23 +334,23 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
             logger.error(f"[EmojiTextSelector] 语义匹配异常: {exc}")
             return None, None
 
-    async def _fetch_conversation_context(self, stream_id: str) -> str:
-        """获取并格式化最近的对话上下文，返回 planner 风格文本。失败返回空字符串。"""
+    async def _fetch_conversation_context(self, stream_id: str) -> selection.ContextWindow:
+        """获取最近的完整消息块，并按固定字符预算保留最新上下文。"""
         if not stream_id:
-            return ""
+            return selection.ContextWindow("", 0, 0, False)
         try:
             messages = await self.ctx.message.get_recent(
                 stream_id,
-                limit=max(1, self.config.selector.context_message_limit),
+                limit=self.config.selector.context_message_limit,
             )
             if not messages:
-                return ""
-            return prompting.build_conversation_context(messages)
+                return selection.ContextWindow("", 0, 0, False)
+            return selection.build_recent_context(messages)
         except Exception as exc:
             logger.debug(
                 f"[EmojiTextSelector] 获取对话上下文异常: {exc}"
             )
-            return ""
+            return selection.ContextWindow("", 0, 0, False)
 
     # ─── Tool: select_emoji_with_text ────────────────────────
 
@@ -440,7 +440,8 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
                     "error": "表情包库中没有包含图片数据的可用记录",
                 }
 
-            extra_context = await self._fetch_conversation_context(stream_id)
+            context_window = await self._fetch_conversation_context(stream_id)
+            extra_context = context_window.text
 
             # ── 3. 语义向量匹配（优先） ──
             if self.config.semantic.enabled and not self._cache.is_empty:
@@ -448,7 +449,7 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
                     query_text = emotion_hint.strip() if emotion_hint else ""
                     if not query_text and extra_context:
                         # 无 emotion_hint 时用对话上下文作为查询
-                        query_text = extra_context[:500]
+                        query_text = extra_context
 
                     if query_text:
                         matched_tag, matched_desc = await self._semantic_select(

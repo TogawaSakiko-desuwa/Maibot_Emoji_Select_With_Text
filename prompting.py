@@ -1,12 +1,13 @@
 """Pure prompt construction and LLM response parsing."""
 
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import json
 import logging
 import re
+
+from . import selection
 
 
 logger = logging.getLogger("Maibot_Emoji_Select_With_Text")
@@ -33,37 +34,11 @@ def load_prompt_template() -> str:
 def build_conversation_context(messages: list[dict[str, Any]]) -> str:
     """将原始消息列表构建为接近 planner 格式的对话上下文。"""
 
-    blocks: list[str] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        message_info = message.get("message_info", {})
-        user_info = message_info.get("user_info", {}) if isinstance(message_info, dict) else {}
-        message_id = message.get("message_id", "")
-        timestamp = message.get("timestamp", "")
-        user_name = user_info.get("user_nickname") or user_info.get("user_name") or ""
-        user_card = user_info.get("user_cardname") or user_info.get("user_card") or ""
-        content = (
-            message.get("processed_plain_text")
-            or message.get("plain_text")
-            or message.get("content")
-            or message.get("text")
-            or ""
-        )
-        if not str(content).strip():
-            continue
-        try:
-            time_text = datetime.fromtimestamp(float(timestamp)).strftime("%H:%M:%S")
-        except (ValueError, TypeError):
-            time_text = str(timestamp)
-        lines: list[str] = []
-        if message_id:
-            lines.append(f"[msg_id]{message_id}")
-        lines.extend((f"[时间]{time_text}", f"[用户名]{user_name}"))
-        if user_card and user_card != user_name:
-            lines.append(f"[用户群昵称]{user_card}")
-        lines.append(f"[发言内容]{content}")
-        blocks.append("\n".join(lines))
+    blocks = [
+        block
+        for message in messages
+        if (block := selection.format_message_block(message))
+    ]
     return "\n\n".join(blocks)
 
 
