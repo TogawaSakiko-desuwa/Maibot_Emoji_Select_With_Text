@@ -2,13 +2,31 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+import time
 
 
 CONTEXT_CHARACTER_BUDGET = 4_000
 CONTEXT_TRUNCATION_MARKER = "[上下文已截断，仅保留最新内容]"
+LARGE_CANDIDATE_THRESHOLD = 100
+
+
+@dataclass(frozen=True, slots=True)
+class EmojiCandidate:
+    """One sendable emoji record from the current Host snapshot."""
+
+    description: str
+    base64_data: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateSet:
+    """Cleaned candidates plus non-fatal warning codes."""
+
+    candidates: tuple[EmojiCandidate, ...]
+    warnings: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +37,74 @@ class ContextWindow:
     message_count: int
     character_count: int
     truncated: bool
+
+
+@dataclass(slots=True)
+class SelectionDiagnostics:
+    """Non-sensitive execution facts for one tool invocation."""
+
+    stage: str = "validate_input"
+    method: str = "none"
+    candidate_count: int = 0
+    context_message_count: int = 0
+    context_character_count: int = 0
+    warnings: list[str] = field(default_factory=list)
+    _started_at: float = field(default_factory=time.perf_counter, repr=False)
+
+    def add_warning(self, code: str) -> None:
+        if code not in self.warnings:
+            self.warnings.append(code)
+
+    def set_context(self, context: ContextWindow) -> None:
+        self.context_message_count = context.message_count
+        self.context_character_count = context.character_count
+        if context.truncated:
+            self.add_warning("context_truncated")
+
+    def as_dict(self) -> dict[str, object]:
+        duration_ms = max(0, round((time.perf_counter() - self._started_at) * 1_000))
+        return {
+            "stage": self.stage,
+            "method": self.method,
+            "candidate_count": self.candidate_count,
+            "context_message_count": self.context_message_count,
+            "context_character_count": self.context_character_count,
+            "duration_ms": duration_ms,
+            "warnings": list(self.warnings),
+        }
+
+
+def prepare_candidates(records: list[object], *, limit: int) -> CandidateSet:
+    """Clean, de-duplicate and optionally limit one Host emoji snapshot."""
+
+    if limit < 0:
+        raise ValueError("limit must not be negative")
+
+    candidates: list[EmojiCandidate] = []
+    seen_descriptions: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        raw_description = record.get("description")
+        raw_base64 = record.get("base64")
+        if not isinstance(raw_description, str) or not isinstance(raw_base64, str):
+            continue
+        description = raw_description.strip()
+        base64_data = raw_base64.strip()
+        if not description or not base64_data or description in seen_descriptions:
+            continue
+
+        seen_descriptions.add(description)
+        candidates.append(EmojiCandidate(description, base64_data))
+        if limit > 0 and len(candidates) >= limit:
+            break
+
+    warnings = (
+        ("large_candidate_set",)
+        if len(candidates) > LARGE_CANDIDATE_THRESHOLD
+        else ()
+    )
+    return CandidateSet(tuple(candidates), warnings)
 
 
 def format_message_block(message: object) -> str | None:
