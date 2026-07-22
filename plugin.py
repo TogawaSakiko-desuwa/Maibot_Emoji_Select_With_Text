@@ -13,7 +13,7 @@ import asyncio
 import logging
 import time
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar
 
 import numpy as np
 from maibot_sdk import HookHandler, MaiBotPlugin, PluginConfigBase, Tool
@@ -33,8 +33,13 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._cache = emoji_cache.EmojiEmbeddingCache()
-        self._refresh_task: Optional[asyncio.Task] = None
-        self._plugin_dir: Optional[Path] = None
+        self._refresh_task: asyncio.Task | None = None
+        self._refresh_lock = asyncio.Lock()
+        self._refresh_wakeup = asyncio.Event()
+        self._refresh_requested = False
+        self._plugin_dir: Path | None = None
+        self._semantic_task_name: str | None = None
+        self._semantic_candidate_limit: int | None = None
 
     @classmethod
     def build_config_schema(
@@ -61,20 +66,28 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._plugin_dir = Path(__file__).parent
-        cache_dir = self._plugin_dir / ".cache"
+        self._semantic_task_name = self.config.semantic.embedding_task
+        self._semantic_candidate_limit = self.config.selector.max_emotion_tags
 
         if self.config.semantic.enabled:
-            if self._cache.load_from_disk(cache_dir):
-                logger.info(f"[EmojiTextSelector] 从磁盘恢复向量缓存成功，共 {self._cache.count} 条")
+            restored = emoji_cache.EmojiEmbeddingCache.load(self._cache_path())
+            if restored is not None:
+                self._cache = restored
+                logger.info(
+                    "[EmojiTextSelector] 从磁盘恢复向量缓存成功，共 %d 条",
+                    self._cache.count,
+                )
+            if (
+                not self._cache.is_empty
+                and self._cache.identity is not None
+                and self._cache.identity.task_name != self.config.semantic.embedding_task
+            ):
+                self._request_refresh()
             self._start_refresh_task()
         logger.info("[EmojiTextSelector] 插件已加载")
 
     async def on_unload(self) -> None:
         await self._stop_refresh_task()
-
-        if self._plugin_dir is not None:
-            self._cache.save_to_disk(self._plugin_dir / ".cache")
-
         logger.info("[EmojiTextSelector] 插件已卸载")
 
     async def on_config_update(
@@ -83,27 +96,70 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
         del config_data, version
         if scope != "self":
             return
+        worker_was_running = self._refresh_task is not None and not self._refresh_task.done()
+        current_task_name = self.config.semantic.embedding_task
+        current_candidate_limit = self.config.selector.max_emotion_tags
+        task_changed = (
+            self._semantic_task_name is not None
+            and self._semantic_task_name != current_task_name
+        )
+        candidate_limit_changed = (
+            self._semantic_candidate_limit is not None
+            and self._semantic_candidate_limit != current_candidate_limit
+        )
+        self._semantic_task_name = current_task_name
+        self._semantic_candidate_limit = current_candidate_limit
         if self.config.semantic.enabled:
-            if self._plugin_dir is not None and self._cache.is_empty:
-                self._cache.load_from_disk(self._plugin_dir / ".cache")
+            if task_changed or candidate_limit_changed:
+                await self._stop_refresh_task()
+                self._request_refresh()
+            elif not worker_was_running:
+                self._request_refresh()
+            if self._cache.is_empty:
+                restored = emoji_cache.EmojiEmbeddingCache.load(self._cache_path())
+                if restored is not None:
+                    self._cache = restored
             self._start_refresh_task()
+            self._refresh_wakeup.set()
         else:
             await self._stop_refresh_task()
 
     def _start_refresh_task(self) -> None:
         if self._refresh_task is None or self._refresh_task.done():
             self._refresh_task = asyncio.create_task(self._background_refresh_loop())
+        self._refresh_wakeup.set()
+
+    def _request_refresh(self) -> None:
+        self._refresh_requested = True
+        self._refresh_wakeup.set()
 
     async def _stop_refresh_task(self) -> None:
         task = self._refresh_task
         self._refresh_task = None
         if task is None:
             return
+        self._refresh_wakeup.set()
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
+
+    def _cache_path(self) -> Path:
+        return Path(self.ctx.paths.data_dir) / emoji_cache.CACHE_FILE_NAME
+
+    def _cleanup_legacy_cache(self) -> None:
+        if self._plugin_dir is None:
+            return
+        legacy_directory = self._plugin_dir / ".cache"
+        for filename in emoji_cache.LEGACY_CACHE_FILE_NAMES:
+            try:
+                (legacy_directory / filename).unlink(missing_ok=True)
+            except OSError as error:
+                logger.warning(
+                    "[EmojiTextSelector] 清理旧缓存失败: %s",
+                    type(error).__name__,
+                )
 
     def _prepare_candidates(self, records: list[object]) -> selection.CandidateSet:
         """Return cleaned candidates from one Host snapshot."""
@@ -149,210 +205,258 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
 
     async def _background_refresh_loop(self) -> None:
         """后台定时刷新向量缓存。仅在语义匹配启用时运行。"""
-        await asyncio.sleep(5)
         while True:
             try:
+                self._refresh_wakeup.clear()
+                retry_after_timeout = False
                 if not self.config.semantic.enabled:
-                    await asyncio.sleep(30)
-                    continue
+                    return
                 interval = self.config.semantic.refresh_interval_seconds
-                if self._cache.needs_refresh(interval):
-                    await self._refresh_cache()
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.error(f"[EmojiTextSelector] 向量缓存刷新失败: {exc}")
-            await asyncio.sleep(30)
-
-    async def _refresh_cache(self) -> None:
-        """从实际表情记录加载描述，增量计算 embedding 向量。
-
-        不再按标签调用 ``get_by_description``。核心模糊检索在没有命中时
-        仍可能返回零相似度的随机表情，使用其结果构建索引会污染描述与
-        图片之间的对应关系。
-        """
-        self._cache.set_refreshing()
-        refresh_start = time.time()
-        try:
-            try:
-                emojis: list[dict[str, Any]] = await self.ctx.emoji.get_all()
-            except Exception as exc:
-                logger.warning(f"[EmojiTextSelector] 获取表情记录失败: {exc}")
-                return
-
-            if not isinstance(emojis, list) or not emojis:
-                return
-
-            emojis = self._prepare_candidates(emojis).candidates
-            if not emojis:
-                return
-
-            # 使用真实描述作为稳定键，确保描述与图片来自同一条记录。
-            old_tag_to_id: Dict[str, int] = self._cache.get_tag_to_id_map()
-            next_id = max(old_tag_to_id.values()) + 1 if old_tag_to_id else 0
-
-            # 分配稳定的 cache_id；候选已在共享入口完成清洗与去重。
-            valid_ids: set[int] = set()
-            changed_ids: set[int] = set()
-            texts_to_embed: List[Tuple[int, str]] = []
-            id_to_tag: Dict[int, str] = {}
-
-            for candidate in emojis:
-                desc = candidate.description
-                tag = desc
-
-                cache_id = old_tag_to_id.get(tag, next_id)
-                if cache_id == next_id:
-                    next_id += 1
-                valid_ids.add(cache_id)
-                id_to_tag[cache_id] = tag
-
-                if self._cache.get_text_key(cache_id) != desc:
-                    changed_ids.add(cache_id)
-                    texts_to_embed.append((cache_id, desc))
-
-            # 保留已有条目（排除变更的，其旧向量将在后面被新向量覆盖）
-            kept_ids, kept_matrix, kept_text_keys, kept_emotion_tags = (
-                self._cache.get_existing_entries(valid_ids, changed_ids)
-            )
-
-            # 分批计算新增/变更的 embedding
-            batch_size = max(1, self.config.semantic.embed_batch_size)
-            new_ids: List[int] = []
-            new_vectors: List[List[float]] = []
-            new_text_keys: Dict[int, str] = {}
-            new_emotion_tags: Dict[int, str] = {}
-
-            if texts_to_embed:
-                for batch_start in range(0, len(texts_to_embed), batch_size):
-                    batch_items = texts_to_embed[batch_start:batch_start + batch_size]
-                    batch_texts = [text_key for _, text_key in batch_items]
-
-                    embed_result = None
-                    for attempt in range(2):
-                        try:
-                            embed_result = await self.ctx.llm.embed(texts=batch_texts)
-                            break
-                        except Exception as exc:
-                            if attempt == 0:
-                                logger.warning(
-                                    f"[EmojiTextSelector] embedding 调用失败（第1次），"
-                                    f"10s 后重试: {exc}"
-                                )
-                                await asyncio.sleep(10)
-                            else:
-                                logger.error(
-                                    f"[EmojiTextSelector] embedding 调用失败（第2次），"
-                                    f"跳过当前批次 ({len(batch_items)} 条): {exc}"
-                                )
-
-                    if embed_result is None:
-                        continue
-
-                    if isinstance(embed_result, dict) and embed_result.get("success"):
-                        emb_results = embed_result.get("results", [])
-                        if len(emb_results) < len(batch_items):
-                            dropped = len(batch_items) - len(emb_results)
-                            logger.warning(
-                                f"[EmojiTextSelector] embedding API 返回结果不足: "
-                                f"请求 {len(batch_items)} 条，仅收到 {len(emb_results)} 条，"
-                                f"{dropped} 条描述将回退到旧缓存"
-                            )
-                        for i, (cache_id, text_key) in enumerate(batch_items):
-                            if i < len(emb_results):
-                                vector = emb_results[i].get("embedding", [])
-                                if vector:
-                                    new_ids.append(cache_id)
-                                    new_vectors.append(vector)
-                                    new_text_keys[cache_id] = text_key
-                                    new_emotion_tags[cache_id] = id_to_tag.get(cache_id, "")
+                identity = self._cache.identity
+                task_mismatch = (
+                    not self._cache.is_empty
+                    and (identity is None or identity.task_name != self.config.semantic.embedding_task)
+                )
+                if self._refresh_requested or task_mismatch or self._cache.needs_refresh(interval):
+                    self._refresh_requested = False
+                    refreshed = await self._refresh_cache()
+                    if refreshed:
+                        delay = interval
                     else:
-                        logger.warning(f"[EmojiTextSelector] 批量 embedding 失败: {embed_result}")
+                        delay = 30
+                        retry_after_timeout = True
+                else:
+                    elapsed = max(0.0, time.time() - self._cache.refreshed_at)
+                    delay = max(0.1, interval - elapsed)
 
-            # 合并：new 覆盖 kept 中的同 id 条目（embedding 成功时用新向量，失败时保留旧向量）
-            new_id_set = set(new_ids)
-            final_ids: List[int] = []
-            final_text_keys: Dict[int, str] = {}
-            final_emotion_tags: Dict[int, str] = {}
-            matrix_rows: List[np.ndarray] = []
-
-            for i, cid in enumerate(kept_ids):
-                if cid in new_id_set:
+                if self._refresh_requested:
                     continue
-                final_ids.append(cid)
-                final_text_keys[cid] = kept_text_keys.get(cid, "")
-                final_emotion_tags[cid] = kept_emotion_tags.get(cid, "")
-                if kept_matrix.size > 0:
-                    matrix_rows.append(kept_matrix[i])
+                try:
+                    await asyncio.wait_for(self._refresh_wakeup.wait(), timeout=delay)
+                except TimeoutError:
+                    if retry_after_timeout:
+                        self._refresh_requested = True
+                else:
+                    if retry_after_timeout:
+                        self._refresh_requested = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "[EmojiTextSelector] 向量缓存刷新循环异常: %s",
+                    type(exc).__name__,
+                )
+                await asyncio.sleep(30)
 
-            for i, cid in enumerate(new_ids):
-                final_ids.append(cid)
-                final_text_keys[cid] = new_text_keys.get(cid, "")
-                final_emotion_tags[cid] = new_emotion_tags.get(cid, "")
-                matrix_rows.append(np.array(new_vectors[i], dtype=np.float32))
+    async def _refresh_cache(self) -> bool:
+        """Build a complete staging snapshot and commit it transactionally."""
 
-            if matrix_rows:
-                all_matrix = np.vstack(matrix_rows)
-            else:
-                all_matrix = np.empty((0, 0), dtype=np.float32)
+        async with self._refresh_lock:
+            refresh_start = time.perf_counter()
+            task_name = self.config.semantic.embedding_task
+            candidate_limit = self.config.selector.max_emotion_tags
+            if not self.config.semantic.enabled:
+                return False
+            try:
+                raw_records = await self.ctx.emoji.get_all()
+            except Exception as exc:
+                logger.warning(
+                    "[EmojiTextSelector] 获取表情记录失败: %s",
+                    type(exc).__name__,
+                )
+                return False
 
-            self._cache.rebuild(final_ids, final_text_keys, final_emotion_tags, all_matrix)
+            if isinstance(raw_records, dict):
+                if raw_records.get("success") is True and isinstance(
+                    raw_records.get("emojis"), list
+                ):
+                    raw_records = raw_records["emojis"]
+                else:
+                    logger.warning("[EmojiTextSelector] Host 返回表情记录读取失败")
+                    return False
+            if not isinstance(raw_records, list):
+                logger.warning("[EmojiTextSelector] Host 返回了未知的表情记录结构")
+                return False
 
-            if self._plugin_dir is not None:
-                self._cache.save_to_disk(self._plugin_dir / ".cache")
+            if not raw_records:
+                if not self._semantic_config_matches(task_name, candidate_limit):
+                    return False
+                try:
+                    self._cache_path().unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "[EmojiTextSelector] 清理空表情库缓存失败: %s",
+                        type(exc).__name__,
+                    )
+                    return False
+                self._cache = emoji_cache.EmojiEmbeddingCache.empty(
+                    refreshed_at=time.time()
+                )
+                self._cleanup_legacy_cache()
+                logger.info("[EmojiTextSelector] 表情包库为空，已清理语义缓存")
+                return True
 
-            refresh_elapsed_ms = (time.time() - refresh_start) * 1000
-            logger.info(
-                f"[EmojiTextSelector] 向量缓存刷新完成，共 {self._cache.count} 条表情包描述，"
-                f"本次新增/更新 {len(new_ids)} 条，耗时 {refresh_elapsed_ms:.0f}ms"
+            candidate_set = selection.prepare_candidates(
+                raw_records,
+                limit=candidate_limit,
             )
-        finally:
-            self._cache.mark_refreshed()
+            descriptions = [candidate.description for candidate in candidate_set.candidates]
+            if not descriptions:
+                logger.warning("[EmojiTextSelector] 表情记录中没有可构建缓存的有效候选")
+                return False
+
+            try:
+                probe_result = await self.ctx.llm.embed(
+                    text=descriptions[0],
+                    task_name=task_name,
+                )
+                probe_vector, model_name = emoji_cache.parse_embedding_vector(
+                    probe_result
+                )
+                identity = emoji_cache.EmbeddingIdentity(
+                    task_name=task_name,
+                    model_name=model_name,
+                    dimension=int(probe_vector.size),
+                )
+
+                reusable = self._cache.reusable_vectors(descriptions, identity)
+                vectors_by_description = dict(reusable)
+                vectors_by_description[descriptions[0]] = probe_vector
+                pending_descriptions = [
+                    description
+                    for description in descriptions[1:]
+                    if description not in reusable
+                ]
+
+                batch_size = self.config.semantic.embed_batch_size
+                for batch_start in range(0, len(pending_descriptions), batch_size):
+                    batch = pending_descriptions[batch_start:batch_start + batch_size]
+                    batch_result = await self.ctx.llm.embed(
+                        texts=batch,
+                        task_name=task_name,
+                    )
+                    if not isinstance(batch_result, dict) or batch_result.get("success") is not True:
+                        raise ValueError("批量 embedding 调用失败")
+                    results = batch_result.get("results")
+                    if not isinstance(results, list) or len(results) != len(batch):
+                        raise ValueError("批量 embedding 结果数量不一致")
+                    for description, result in zip(batch, results, strict=True):
+                        vector, _ = emoji_cache.parse_embedding_vector(
+                            result,
+                            expected_model_name=identity.model_name,
+                            expected_dimension=identity.dimension,
+                        )
+                        vectors_by_description[description] = vector
+
+                matrix = np.vstack(
+                    [vectors_by_description[description] for description in descriptions]
+                )
+                staging = emoji_cache.EmojiEmbeddingCache.build(
+                    descriptions=descriptions,
+                    vectors=matrix,
+                    identity=identity,
+                    refreshed_at=time.time(),
+                )
+                if not self._semantic_config_matches(task_name, candidate_limit):
+                    return False
+                staging.save_atomic(self._cache_path())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[EmojiTextSelector] 语义缓存刷新未提交: %s",
+                    type(exc).__name__,
+                )
+                return False
+
+            self._cache = staging
+            self._cleanup_legacy_cache()
+            elapsed_ms = round((time.perf_counter() - refresh_start) * 1_000)
+            logger.info(
+                "[EmojiTextSelector] 向量缓存刷新完成: count=%d reused=%d "
+                "duration_ms=%d",
+                self._cache.count,
+                len(reusable),
+                elapsed_ms,
+            )
+            return True
+
+    def _semantic_config_matches(self, task_name: str, candidate_limit: int) -> bool:
+        return (
+            self.config.semantic.enabled
+            and self.config.semantic.embedding_task == task_name
+            and self.config.selector.max_emotion_tags == candidate_limit
+        )
 
     async def _semantic_select(
         self,
         query_text: str,
-    ) -> Tuple[Optional[str], Optional[str]]:
-        """语义向量匹配。返回 (matched_tag, matched_description) 或 (None, None)。"""
+    ) -> tuple[str | None, str | None]:
+        """Return ``(description, warning_code)`` for one semantic query."""
+
         if not query_text.strip():
-            return None, None
+            return None, "semantic_query_empty"
+
+        task_name = self.config.semantic.embedding_task
+        cache_snapshot = self._cache
+        identity = cache_snapshot.identity
+        if identity is None or identity.task_name != task_name:
+            self._request_refresh()
+            return None, "semantic_cache_mismatch"
 
         try:
-            embed_result = await self.ctx.llm.embed(text=query_text)
-            if not isinstance(embed_result, dict) or not embed_result.get("success"):
-                logger.warning("[EmojiTextSelector] 查询 embedding 失败")
-                return None, None
-
-            raw_vector = embed_result.get("embedding", [])
-            if not raw_vector:
-                return None, None
-
-            query_vector = np.array(raw_vector, dtype=np.float32)
-            q_norm = np.linalg.norm(query_vector)
-            if q_norm < 1e-12:
-                return None, None
-            query_vector = query_vector / q_norm
-
-            threshold = self.config.semantic.similarity_threshold
-            top_matches = self._cache.search(query_vector, threshold, max_count=1)
-            if not top_matches:
-                logger.info("[EmojiTextSelector] 语义匹配未找到超过阈值的表情包")
-                return None, None
-
-            best_id, best_score = top_matches[0]
-            matched_tag = self._cache.get_emotion_tag(best_id)
-            matched_desc = self._cache.get_text_key(best_id)
-            logger.info(
-                "[EmojiTextSelector] 语义匹配命中: score=%.3f",
-                best_score,
+            embed_result = await self.ctx.llm.embed(
+                text=query_text,
+                task_name=task_name,
             )
-            return matched_tag, matched_desc
         except Exception as exc:
-            logger.error(
-                "[EmojiTextSelector] 语义匹配异常: %s",
+            logger.warning(
+                "[EmojiTextSelector] 查询 embedding 调用失败: %s",
                 type(exc).__name__,
             )
-            return None, None
+            return None, "semantic_error"
+
+        if not isinstance(embed_result, dict) or embed_result.get("success") is not True:
+            logger.warning("[EmojiTextSelector] 查询 embedding 失败")
+            return None, "semantic_api_error"
+
+        try:
+            query_vector, model_name = emoji_cache.parse_embedding_vector(embed_result)
+        except ValueError:
+            logger.warning("[EmojiTextSelector] 查询 embedding 返回了无效向量")
+            return None, "semantic_invalid_vector"
+
+        query_identity = emoji_cache.EmbeddingIdentity(
+            task_name=task_name,
+            model_name=model_name,
+            dimension=int(query_vector.size),
+        )
+        if query_identity != identity:
+            self._request_refresh()
+            logger.info("[EmojiTextSelector] 查询 embedding 身份已变化，等待缓存重建")
+            return None, "semantic_cache_mismatch"
+
+        query_vector = query_vector / np.linalg.norm(query_vector)
+        try:
+            top_matches = cache_snapshot.search_descriptions(
+                query_vector,
+                self.config.semantic.similarity_threshold,
+                max_count=1,
+            )
+        except ValueError:
+            self._request_refresh()
+            return None, "semantic_cache_mismatch"
+
+        if not top_matches:
+            logger.info("[EmojiTextSelector] 语义匹配未找到超过阈值的表情包")
+            return None, "semantic_below_threshold"
+
+        matched_description, best_score = top_matches[0]
+        logger.info(
+            "[EmojiTextSelector] 语义匹配命中: score=%.3f",
+            best_score,
+        )
+        return matched_description, None
 
     async def _fetch_conversation_context(self, stream_id: str) -> selection.ContextWindow:
         """获取最近的完整消息块，并按固定字符预算保留最新上下文。"""
@@ -506,10 +610,12 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
                         query_text = extra_context
 
                     if query_text:
-                        matched_tag, matched_desc = await self._semantic_select(
+                        matched_desc, semantic_warning = await self._semantic_select(
                             query_text
                         )
-                        if matched_tag and matched_desc:
+                        if semantic_warning:
+                            diagnostics.add_warning(semantic_warning)
+                        if matched_desc:
                             # matched_desc 必须精确命中本轮实际记录；禁止再次使用
                             # get_by_description 模糊查询。
                             emoji_result = desc_to_emoji.get(matched_desc)
@@ -555,8 +661,6 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
                                 "将降级到文本 LLM 选择"
                             )
                             diagnostics.add_warning("semantic_stale_match")
-                        else:
-                            diagnostics.add_warning("semantic_fallback")
                     else:
                         diagnostics.add_warning("semantic_query_empty")
                 except Exception as exc:
