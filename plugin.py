@@ -161,6 +161,64 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
                     type(error).__name__,
                 )
 
+    async def _read_emoji_snapshot(self) -> list[object] | None:
+        """Read and normalize one Host emoji-library response."""
+
+        try:
+            raw_records = await self.ctx.emoji.get_all()
+        except Exception as exc:
+            logger.warning(
+                "[EmojiTextSelector] 读取表情包库异常: %s",
+                type(exc).__name__,
+            )
+            return None
+
+        if isinstance(raw_records, list):
+            return raw_records
+        if (
+            isinstance(raw_records, dict)
+            and raw_records.get("success") is True
+            and isinstance(raw_records.get("emojis"), list)
+        ):
+            return raw_records["emojis"]
+
+        logger.warning(
+            "[EmojiTextSelector] Host 返回了不可用的表情包库结果: %s",
+            type(raw_records).__name__,
+        )
+        return None
+
+    async def _send_emoji_once(
+        self,
+        base64_data: str,
+        stream_id: str,
+        *,
+        method: str,
+    ) -> bool:
+        """Send exactly once and normalize SDK or defensive envelope results."""
+
+        try:
+            result = await self.ctx.send.emoji(base64_data, stream_id)
+        except Exception as exc:
+            logger.error(
+                "[EmojiTextSelector] 发送表情包异常: method=%s error=%s",
+                method,
+                type(exc).__name__,
+            )
+            return False
+
+        success = (
+            result.get("success") is True
+            if isinstance(result, dict)
+            else bool(result)
+        )
+        if not success:
+            logger.error(
+                "[EmojiTextSelector] 发送表情包失败: method=%s",
+                method,
+            )
+        return success
+
     def _prepare_candidates(self, records: list[object]) -> selection.CandidateSet:
         """Return cleaned candidates from one Host snapshot."""
 
@@ -257,25 +315,8 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
             candidate_limit = self.config.selector.max_emotion_tags
             if not self.config.semantic.enabled:
                 return False
-            try:
-                raw_records = await self.ctx.emoji.get_all()
-            except Exception as exc:
-                logger.warning(
-                    "[EmojiTextSelector] 获取表情记录失败: %s",
-                    type(exc).__name__,
-                )
-                return False
-
-            if isinstance(raw_records, dict):
-                if raw_records.get("success") is True and isinstance(
-                    raw_records.get("emojis"), list
-                ):
-                    raw_records = raw_records["emojis"]
-                else:
-                    logger.warning("[EmojiTextSelector] Host 返回表情记录读取失败")
-                    return False
-            if not isinstance(raw_records, list):
-                logger.warning("[EmojiTextSelector] Host 返回了未知的表情记录结构")
+            raw_records = await self._read_emoji_snapshot()
+            if raw_records is None:
                 return False
 
             if not raw_records:
@@ -524,38 +565,8 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
             # 1. 读取实际表情记录。必须先取得真实记录，再做选择；不能先用
             # get_emotions() 获得标签后逐个模糊查询，否则零相似度候选也可能
             # 被核心查询返回，污染候选列表并发送错误图片。
-            try:
-                raw_emoji_records = await self.ctx.emoji.get_all()
-            except Exception as exc:
-                logger.warning(
-                    "[EmojiTextSelector] 读取表情包库失败: %s",
-                    type(exc).__name__,
-                )
-                return self._finish_tool_result(
-                    diagnostics,
-                    success=False,
-                    stage="read_library",
-                    error="读取表情包库失败",
-                )
-
-            if isinstance(raw_emoji_records, dict):
-                if raw_emoji_records.get("success") is True and isinstance(
-                    raw_emoji_records.get("emojis"), list
-                ):
-                    raw_emoji_records = raw_emoji_records["emojis"]
-                else:
-                    logger.warning("[EmojiTextSelector] Host 返回表情包读取失败")
-                    return self._finish_tool_result(
-                        diagnostics,
-                        success=False,
-                        stage="read_library",
-                        error="读取表情包库失败",
-                    )
-            elif not isinstance(raw_emoji_records, list):
-                logger.warning(
-                    "[EmojiTextSelector] 表情包库返回了未知数据结构: %s",
-                    type(raw_emoji_records).__name__,
-                )
+            raw_emoji_records = await self._read_emoji_snapshot()
+            if raw_emoji_records is None:
                 return self._finish_tool_result(
                     diagnostics,
                     success=False,
@@ -621,23 +632,11 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
                             emoji_result = desc_to_emoji.get(matched_desc)
                             emoji_base64 = emoji_result.base64_data if emoji_result else ""
                             if emoji_base64:
-                                try:
-                                    send_result = await self.ctx.send.emoji(
-                                        emoji_base64, stream_id
-                                    )
-                                except Exception as exc:
-                                    logger.error(
-                                        "[EmojiTextSelector] 语义匹配发送异常: %s",
-                                        type(exc).__name__,
-                                    )
-                                    return self._finish_tool_result(
-                                        diagnostics,
-                                        success=False,
-                                        stage="send",
-                                        selection_method="semantic",
-                                        error="发送表情包失败",
-                                    )
-                                if send_result:
+                                if await self._send_emoji_once(
+                                    emoji_base64,
+                                    stream_id,
+                                    method="semantic",
+                                ):
                                     return self._finish_tool_result(
                                         diagnostics,
                                         success=True,
@@ -646,9 +645,6 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
                                         content=f"表情包发送成功（{matched_desc}）",
                                         description=matched_desc,
                                     )
-                                logger.error(
-                                    "[EmojiTextSelector] 语义匹配发送失败，不再尝试第二次发送"
-                                )
                                 return self._finish_tool_result(
                                     diagnostics,
                                     success=False,
@@ -755,22 +751,11 @@ class EmojiTextSelectorPlugin(MaiBotPlugin):
                 )
 
             # 7. 发送
-            try:
-                send_result = await self.ctx.send.emoji(emoji_base64, stream_id)
-            except Exception as exc:
-                logger.error(
-                    "[EmojiTextSelector] 发送表情包异常: %s",
-                    type(exc).__name__,
-                )
-                return self._finish_tool_result(
-                    diagnostics,
-                    success=False,
-                    stage="send",
-                    selection_method="text_llm",
-                    error="发送表情包失败",
-                )
-            if not send_result:
-                logger.error("[EmojiTextSelector] 发送表情包失败")
+            if not await self._send_emoji_once(
+                emoji_base64,
+                stream_id,
+                method="text_llm",
+            ):
                 return self._finish_tool_result(
                     diagnostics,
                     success=False,
