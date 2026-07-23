@@ -2,3 +2,9 @@ config_back/
 .venv/
 __pycache__/
 .cache/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+emoji_semantic_cache.npz

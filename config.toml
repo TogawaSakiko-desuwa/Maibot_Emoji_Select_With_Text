@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.0.0"
+config_version = "1.1.0"
 
 [general]
 filter_send_emoji = true
@@ -15,3 +15,4 @@ enabled = false
 refresh_interval_seconds = 300
 similarity_threshold = 0.3
 embed_batch_size = 64
+embedding_task = "embedding"
