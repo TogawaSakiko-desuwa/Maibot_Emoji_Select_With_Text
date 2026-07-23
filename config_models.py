@@ -11,7 +11,7 @@ class PluginSectionConfig(PluginConfigBase):
 
     enabled: bool = Field(default=True, description="是否启用插件", json_schema_extra={"label": "启用"})
     config_version: str = Field(
-        default="1.1.0",
+        default="1.1.1",
         description="配置版本号",
         json_schema_extra={"label": "配置版本"},
     )

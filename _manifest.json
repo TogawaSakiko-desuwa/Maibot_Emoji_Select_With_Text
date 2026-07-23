@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.1.0",
+  "version": "1.1.1",
   "name": "Maibot_Emoji_Select_With_Text",
   "description": "表情包选择工具，支持 embedding 语义向量匹配和文本 LLM 选择",
   "author": {
