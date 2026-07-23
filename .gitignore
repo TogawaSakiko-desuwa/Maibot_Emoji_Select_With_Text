@@ -1,4 +1,5 @@
 config_back/
+/config.toml
 .venv/
 __pycache__/
 .cache/
