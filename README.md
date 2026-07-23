@@ -58,6 +58,8 @@ git clone https://github.com/TogawaSakiko-desuwa/Maibot_Emoji_Select_With_Text.g
 
 ## 配置
 
+首次加载时，MaiBot 会根据插件的配置模型自动生成 `config.toml`。这个文件保存当前实例的本地设置，不需要手动从仓库复制。
+
 ```toml
 [general]
 filter_send_emoji = true
